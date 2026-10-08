@@ -1,0 +1,62 @@
+# pipeline.yaml: procesa una versión completa en un clúster que Dataproc crea al empezar y borra al terminar.
+# Primero prueba 03 y 04 con la muestra; si fallan, se detiene antes del paso caro (el aplanado completo).
+#
+# Lanzar:   gcloud dataproc workflow-templates instantiate-from-file --file=pipeline.yaml --region=us-central1 --async
+# Revisar:  gcloud dataproc jobs list --region=us-central1
+jobs:
+- stepId: prueba-dataset
+  pysparkJob:
+    mainPythonFileUri: gs://bigdata-507701-wikidata/codigo/03_dataset_clasificador.py
+    args:
+    - --silver=gs://bigdata-507701-wikidata/pruebas/silver
+    - --gold=gs://bigdata-507701-wikidata/pruebas/gold
+    - --version=20261005
+    - --clases=10
+- stepId: prueba-modelo
+  prerequisiteStepIds: [prueba-dataset]
+  pysparkJob:
+    mainPythonFileUri: gs://bigdata-507701-wikidata/codigo/04_modelo.py
+    args:
+    - --gold=gs://bigdata-507701-wikidata/pruebas/gold
+    - --modelos=gs://bigdata-507701-wikidata/pruebas/modelos
+    - --version=20261005
+- stepId: aplanado
+  prerequisiteStepIds: [prueba-modelo]
+  pysparkJob:
+    mainPythonFileUri: gs://bigdata-507701-wikidata/codigo/02_aplanado.py
+    args:
+    - --entrada=gs://bigdata-507701-wikidata/raw/wikidata/version=20261005/wikidata-20261005-all.json.bz2
+    - --version=20261005
+    - --salida=gs://bigdata-507701-wikidata/silver
+- stepId: dataset
+  prerequisiteStepIds: [aplanado]
+  pysparkJob:
+    mainPythonFileUri: gs://bigdata-507701-wikidata/codigo/03_dataset_clasificador.py
+    args:
+    - --silver=gs://bigdata-507701-wikidata/silver
+    - --gold=gs://bigdata-507701-wikidata/gold
+    - --version=20261005
+- stepId: modelo
+  prerequisiteStepIds: [dataset]
+  pysparkJob:
+    mainPythonFileUri: gs://bigdata-507701-wikidata/codigo/04_modelo.py
+    args:
+    - --gold=gs://bigdata-507701-wikidata/gold
+    - --modelos=gs://bigdata-507701-wikidata/modelos
+    - --version=20261005
+placement:
+  managedCluster:
+    clusterName: wd-pipeline
+    config:
+      masterConfig:
+        numInstances: 1
+        machineTypeUri: e2-standard-4
+        diskConfig:
+          bootDiskType: pd-balanced
+          bootDiskSizeGb: 50
+      workerConfig:
+        numInstances: 5
+        machineTypeUri: e2-standard-4
+        diskConfig:
+          bootDiskType: pd-balanced
+          bootDiskSizeGb: 50
