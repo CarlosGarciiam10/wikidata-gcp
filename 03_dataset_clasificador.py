@@ -26,16 +26,46 @@ from pyspark.sql import SparkSession, Window, functions as F
 
 
 def log(msg):
+    """Escribe un mensaje de progreso con la etapa y la hora UTC.
+
+    Args:
+        msg (str): Mensaje que se imprime en la salida estándar.
+
+    Notes:
+        La salida se vacía inmediatamente para aparecer en los logs del job.
+    """
     print(f"[dataset {datetime.now(timezone.utc):%H:%M:%S}] {msg}", flush=True)
 
 
 def normalizar(col):
-    """Minúsculas, números a 0 y espacios colapsados. Así 'publicado en 2019' y
-    'publicado en 2020' cuentan como la misma descripción."""
+    """Construye la expresión de normalización usada para agrupar textos.
+
+    Args:
+        col (Column): Columna de texto original; los valores nulos se conservan.
+
+    Returns:
+        Column: Texto en minúsculas, secuencias de dígitos ASCII sustituidas por
+        '0', espacios en blanco colapsados y extremos sin espacios.
+
+    Notes:
+        'Publicado en 2019' y 'publicado en 2020' producen 'publicado en 0'.
+        No elimina acentos ni puntuación y no aplica lematización. Devuelve
+        una transformación diferida, sin ejecutar acciones ni modificar datos.
+    """
     return F.trim(F.regexp_replace(F.regexp_replace(F.lower(col), r"[0-9]+", "0"), r"\s+", " "))
 
 
 def borrar(spark, ruta):
+    """Elimina una ruta intermedia existente y su contenido recursivamente.
+
+    Args:
+        spark (SparkSession): Sesión con la configuración del filesystem.
+        ruta (str): Archivo o directorio que se elimina mediante Hadoop FS.
+
+    Notes:
+        No realiza ninguna operación si la ruta no existe. No comprueba el
+        resultado booleano de Hadoop; los errores de acceso se propagan.
+    """
     jvm = spark.sparkContext._jvm
     p = jvm.org.apache.hadoop.fs.Path(ruta)
     fs = p.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration())
@@ -44,6 +74,26 @@ def borrar(spark, ruta):
 
 
 def main():
+    """Construye y publica el dataset del clasificador a partir de silver.
+
+    Lee ``--silver``, ``--gold`` y ``--version`` de la línea de comandos. Los
+    parámetros opcionales controlan clases principales, tamaño esperado por
+    clase, fracción de prueba, buckets y semilla.
+
+    Raises:
+        ValueError: Si la versión no se puede interpretar como fecha YYYYMMDD.
+        SystemExit: Si argparse termina por ayuda o argumentos inválidos.
+
+    Notes:
+        Selecciona descripciones españolas y clases P31 frecuentes, asigna una
+        clase por entidad y conserva la clase mayoritaria de cada texto
+        normalizado. El muestreo por clase es probabilístico y la asignación
+        a test redondea hacia abajo la fracción solicitada.
+        Sobrescribe dataset, clases, sin_tipo y resumen en la versión gold.
+        Las candidatas no se restringen al tipo item ni se filtran por texto
+        normalizado no vacío. Las tablas temporales y sus buckets se eliminan
+        al terminar correctamente, pero pueden quedar si ocurre un fallo.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--silver", required=True, help="carpeta base de silver, p. ej. gs://BUCKET/silver")
     ap.add_argument("--gold", required=True, help="carpeta base de gold, p. ej. gs://BUCKET/gold")

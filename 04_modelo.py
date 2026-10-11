@@ -27,11 +27,39 @@ from pyspark.sql import SparkSession, Window, functions as F
 
 
 def log(msg):
+    """Escribe un mensaje de progreso con la etapa y la hora UTC.
+
+    Args:
+        msg (str): Mensaje que se imprime en la salida estándar.
+
+    Notes:
+        La salida se vacía inmediatamente para aparecer en los logs del job.
+    """
     print(f"[modelo {datetime.now(timezone.utc):%H:%M:%S}] {msg}", flush=True)
 
 
 def evaluar(pred, modelo):
-    """Accuracy, F1 macro y métricas por clase a partir de la matriz de confusión."""
+    """Calcula métricas sin ponderación a partir de predicciones etiquetadas.
+
+    Args:
+        pred (DataFrame): Predicciones con columnas ``clase`` (referencia) y
+            ``clase_predicha``. Cada fila cuenta como un ejemplo.
+        modelo (str): Nombre que identifica el modelo en las filas devueltas.
+
+    Returns:
+        tuple: ``(accuracy, f1_macro, por_clase, confusion)``. Los dos primeros
+        elementos son floats; ``por_clase`` contiene tuplas
+        ``(modelo, clase, precision, recall, f1, soporte)`` y ``confusion``
+        contiene tuplas ``(modelo, clase_real, clase_predicha, n)``.
+
+    Notes:
+        Ejecuta una agregación Spark y recopila solo los conteos de confusión.
+        Calcula métricas por las clases observadas como reales o predichas.
+        F1 macro promedia únicamente las clases con soporte real positivo.
+        Un denominador cero produce una métrica de 0.0; con entrada vacía,
+        devuelve accuracy y F1 macro de 0.0 y ambas listas vacías.
+        No utiliza ``n_entidades`` ni ``pureza`` como pesos.
+    """
     conf = [(r["clase"], r["clase_predicha"], r["count"])
             for r in pred.groupBy("clase", "clase_predicha").count().collect()]
     total = sum(n for _, _, n in conf)
@@ -52,6 +80,26 @@ def evaluar(pred, modelo):
 
 
 def main():
+    """Entrena, evalúa y guarda el clasificador y sus propuestas de P31.
+
+    Lee ``--gold``, ``--modelos`` y ``--version`` de la línea de comandos.
+    ``--reg`` y ``--iter`` controlan el ajuste de regresión logística;
+    ``--umbral`` fija la confianza mínima para conservar propuestas.
+
+    Raises:
+        ValueError: Si la versión no se puede interpretar como fecha YYYYMMDD.
+        SystemExit: Si argparse termina por ayuda o argumentos inválidos.
+
+    Notes:
+        Requiere dataset, clases y sin_tipo de la versión gold indicada.
+        Ajusta el preprocesamiento solo con train y compara regresión
+        logística sobre TF-IDF con Naive Bayes sobre conteos TF.
+        Sobrescribe métricas, confusión, errores, propuestas y el pipeline de
+        regresión logística, que siempre se usa como modelo final y no se
+        reentrena con test. El pipeline espera ``texto`` ya normalizado por 03.
+        Conserva propuestas con probabilidad máxima >= umbral y clase distinta
+        de otro. Esa confianza no está calibrada y no se modifica Wikidata.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--gold", required=True, help="carpeta base de gold, p. ej. gs://BUCKET/gold")
     ap.add_argument("--modelos", required=True, help="carpeta para guardar el modelo, p. ej. gs://BUCKET/modelos")

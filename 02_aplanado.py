@@ -57,12 +57,35 @@ P31 = (
 
 
 def log(msg):
+    """Escribe un mensaje de progreso con la etapa y la hora UTC.
+
+    Args:
+        msg (str): Mensaje que se imprime en la salida estándar.
+
+    Notes:
+        La salida se vacía inmediatamente para aparecer en los logs del job.
+    """
     print(f"[aplanado {datetime.now(timezone.utc):%H:%M:%S}] {msg}", flush=True)
 
 
 def leer_y_parsear(spark, entrada):
-    """Una fila por línea con entidad. El archivo es un arreglo JSON con una entidad
-    por línea: se descartan las líneas '[' y ']' y se quita la coma final."""
+    """Construye una fila intermedia por línea candidata a entidad del dump.
+
+    Args:
+        spark (SparkSession): Sesión con acceso al filesystem de la entrada.
+        entrada (str): Ruta del dump JSON, comprimido en bz2 o en texto plano.
+
+    Returns:
+        DataFrame: Campos de entidad, textos es/en, arreglo P31 y columnas de
+        diagnóstico ``ok``, ``linea_con_error`` y ``bytes_linea``.
+
+    Notes:
+        Espera una entidad por línea: excluye las líneas exactas '[' y ']', las
+        vacías y elimina una coma final antes de aplicar el esquema mínimo.
+        ``ok`` indica únicamente que se obtuvo un ID no nulo; no valida todos
+        los campos. P31 excluye rangos deprecated, valores nulos y repetidos.
+        Las transformaciones son diferidas hasta que Spark ejecuta una acción.
+    """
     lineas = spark.read.text(entrada).where(
         ~F.col("value").isin("[", "]") & (F.length("value") > 0))
     entidad = F.from_json(F.regexp_replace("value", ",$", ""), ESQUEMA)
@@ -88,29 +111,80 @@ def leer_y_parsear(spark, entrada):
 # ---------- utilidades de archivos (Hadoop FS, funciona igual con gs:// y local) ----------
 
 def _fs(spark, ruta):
+    """Obtiene el filesystem Hadoop y el objeto Path asociados a una ruta.
+
+    Args:
+        spark (SparkSession): Sesión cuya configuración Hadoop se utiliza.
+        ruta (str): Ruta local o URI soportada por el entorno, como ``gs://``.
+
+    Returns:
+        tuple: Objetos Java ``(FileSystem, Path)`` accesibles mediante Py4J.
+    """
     jvm = spark.sparkContext._jvm
     p = jvm.org.apache.hadoop.fs.Path(ruta)
     return p.getFileSystem(spark.sparkContext._jsc.hadoopConfiguration()), p
 
 
 def existe(spark, ruta):
+    """Comprueba si una ruta existe mediante el filesystem Hadoop.
+
+    Args:
+        spark (SparkSession): Sesión con la configuración del filesystem.
+        ruta (str): Archivo o directorio cuya existencia se consulta.
+
+    Returns:
+        bool: True si la ruta existe; False si no existe.
+
+    Notes:
+        Los errores de acceso al filesystem se propagan al llamador.
+    """
     fs, p = _fs(spark, ruta)
     return fs.exists(p)
 
 
 def borrar(spark, ruta):
+    """Elimina una ruta existente y su contenido de forma recursiva.
+
+    Args:
+        spark (SparkSession): Sesión con la configuración del filesystem.
+        ruta (str): Archivo o directorio que se elimina.
+
+    Notes:
+        No realiza ninguna operación si la ruta no existe. No comprueba el
+        resultado booleano de Hadoop; los errores de acceso se propagan.
+    """
     fs, p = _fs(spark, ruta)
     if fs.exists(p):
         fs.delete(p, True)
 
 
 def borrar_si_vacia(spark, ruta):
+    """Elimina un directorio existente solo si no contiene elementos.
+
+    Args:
+        spark (SparkSession): Sesión con la configuración del filesystem.
+        ruta (str): Directorio que se inspecciona para limpiar intermedios.
+
+    Notes:
+        No realiza ninguna operación si la ruta no existe o tiene elementos.
+        No comprueba el valor booleano devuelto por Hadoop al borrar.
+    """
     fs, p = _fs(spark, ruta)
     if fs.exists(p) and len(fs.listStatus(p)) == 0:
         fs.delete(p, True)
 
 
 def tamano(spark, ruta):
+    """Consulta el tamaño total de una ruta sin propagar errores de consulta.
+
+    Args:
+        spark (SparkSession): Sesión con la configuración del filesystem.
+        ruta (str): Archivo o directorio cuyo contenido se mide.
+
+    Returns:
+        int | None: Bytes obtenidos mediante el resumen de contenido de
+        Hadoop, o None si ocurre una excepción al consultar o convertirlos.
+    """
     try:
         fs, p = _fs(spark, ruta)
         return int(fs.getContentSummary(p).getLength())
@@ -119,7 +193,22 @@ def tamano(spark, ruta):
 
 
 def md5_publicado(spark, entrada, version):
-    """Busca el md5 del archivo en el wikidata-V-md5sums.txt que está junto al dump."""
+    """Busca la suma MD5 publicada para el archivo de entrada.
+
+    Args:
+        spark (SparkSession): Sesión con acceso al archivo de sumas.
+        entrada (str): Ruta del dump cuyo nombre se busca en las sumas.
+        version (str): Fecha YYYYMMDD usada en ``wikidata-V-md5sums.txt``.
+
+    Returns:
+        str | None: Suma publicada si el archivo auxiliar existe y contiene
+        una línea de dos campos cuyo nombre coincide; None en otro caso.
+
+    Notes:
+        El archivo auxiliar se busca en el mismo directorio que la entrada.
+        Esta función no calcula el MD5 del dump ni verifica su integridad.
+        La lectura del archivo de sumas se materializa con ``collect()``.
+    """
     partes = entrada.rstrip("/").rsplit("/", 1)
     carpeta, nombre = partes if len(partes) == 2 else (".", partes[0])
     ruta = f"{carpeta}/wikidata-{version}-md5sums.txt"
@@ -135,6 +224,17 @@ def md5_publicado(spark, entrada, version):
 # ---------- modo --solo-medir ----------
 
 def _contar(filas):
+    """Resume las filas de una partición para la medición de lectura.
+
+    Args:
+        filas (Iterable[tuple[int, int]]): Pares ``(ok, bytes_linea)``;
+            ``ok`` debe ser 0 o 1 y el segundo valor es el tamaño de la línea.
+
+    Returns:
+        list[tuple[int, int, int, float]]: Una lista de una sola tupla con
+        filas totales, filas sin ID, bytes acumulados y segundos de recorrido.
+        El contenedor permite usar la función con ``SparkContext.runJob``.
+    """
     t0 = time.time()
     n = malas = nbytes = 0
     for ok, b in filas:
@@ -145,6 +245,19 @@ def _contar(filas):
 
 
 def medir(spark, entrada):
+    """Mide particiones de entrada e imprime una estimación de lectura total.
+
+    Args:
+        spark (SparkSession): Sesión que ejecuta las tareas de medición.
+        entrada (str): Ruta del dump que se lee con el parser mínimo.
+
+    Notes:
+        Ejecuta la primera partición y la situada en la mitad; si coinciden,
+        mide una sola. Extrapola bytes de JSON y horas-núcleo a partir de sus
+        promedios. No escribe tablas ni estima la duración del flujo completo.
+        El resultado depende de la representatividad de las particiones y del
+        trabajo que Spark necesite para obtener las columnas de diagnóstico.
+    """
     df = leer_y_parsear(spark, entrada).select(F.col("ok").cast("int"), "bytes_linea")
     rdd = df.rdd
     pedazos = rdd.getNumPartitions()
@@ -163,6 +276,26 @@ def medir(spark, entrada):
 # ---------- proceso completo ----------
 
 def main():
+    """Procesa los argumentos CLI y mide o publica una versión en silver.
+
+    Requiere ``--entrada`` y ``--version``; también ``--salida`` salvo en el
+    modo ``--solo-medir``. ``--max-error`` establece la fracción máxima de
+    líneas sin ID aceptada, con valor predeterminado de 0.001.
+
+    Raises:
+        ValueError: Si la versión no se puede interpretar como fecha YYYYMMDD.
+        RuntimeError: Si la entrada no tiene líneas útiles o supera la
+            fracción máxima de líneas sin ID.
+        SystemExit: Si argparse termina por ayuda o argumentos inválidos.
+
+    Notes:
+        La ejecución completa materializa el JSON en un Parquet intermedio,
+        revisa los controles y sobrescribe las tablas silver de esa versión.
+        Los IDs repetidos se desduplican; los inválidos y las clases huérfanas
+        se registran sin bloquear la publicación. Las escrituras son separadas.
+        Al finalizar correctamente registra el catálogo y borra el intermedio;
+        ante un fallo, este puede quedar disponible para diagnóstico.
+    """
     ap = argparse.ArgumentParser()
     ap.add_argument("--entrada", required=True, help="dump .json.bz2 o .json")
     ap.add_argument("--version", required=True, help="fecha del dump, YYYYMMDD")
@@ -200,6 +333,14 @@ def main():
     ok = F.col("ok")
 
     def cuenta(cond):
+        """Construye una agregación que cuenta filas que cumplen una condición.
+
+        Args:
+            cond (Column): Expresión booleana evaluada sobre el intermedio.
+
+        Returns:
+            Column: Suma de indicadores 1/0; una condición nula aporta 0.
+        """
         return F.sum(F.when(cond, 1).otherwise(0))
 
     r = inter.agg(
@@ -235,6 +376,16 @@ def main():
         .parquet(f"{salida}/entidades/version={v}")
 
     def idioma(cod):
+        """Proyecta los textos de un idioma desde las entidades aceptadas.
+
+        Args:
+            cod (str): Sufijo lingüístico presente en el intermedio: es o en.
+
+        Returns:
+            DataFrame: Columnas ``id``, ``idioma``, ``etiqueta`` y
+            ``descripcion``, todavía sin excluir las filas con ambos textos
+            nulos. Utiliza el DataFrame ``buenas`` del ámbito de main.
+        """
         return buenas.select("id", F.lit(cod).alias("idioma"),
                              F.col(f"etiqueta_{cod}").alias("etiqueta"),
                              F.col(f"descripcion_{cod}").alias("descripcion"))
@@ -257,6 +408,16 @@ def main():
         F.count("descripcion").alias("descripciones")).collect()}
 
     def de_idioma(cod, campo):
+        """Recupera un conteo lingüístico, o cero si no existe ese idioma.
+
+        Args:
+            cod (str): Código de idioma que se busca en ``por_idioma``.
+            campo (str): Conteo agregado: filas, etiquetas o descripciones.
+
+        Returns:
+            int: Conteo del campo para el idioma indicado, o 0 si falta el
+            idioma en los resultados recopilados dentro de main.
+        """
         return por_idioma[cod][campo] if cod in por_idioma else 0
 
     # Control referencial: clases de P31 que no existen como entidad en esta versión.
