@@ -22,7 +22,7 @@ dumps.wikimedia.org ──> raw/ (bz2 + md5) ──Spark──> silver/ (Parquet
   y vistas con los campos que usa el tablero.
 - **Data Studio**: tablero con dos páginas, la versión y su cobertura, y el clasificador.
 
-## Versión procesada: 2026-10-05
+## Versión procesada: 2026-10-10 (Sabado)
 
 | Indicador | Valor |
 |---|---|
